@@ -55,6 +55,7 @@
 #include "echo.pb.h"
 #include "v1.pb.h"
 #include "v2.pb.h"
+#include "v3.pb.h"
 
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
@@ -65,6 +66,7 @@ int main(int argc, char* argv[]) {
 namespace brpc {
 DECLARE_bool(enable_threads_service);
 DECLARE_bool(enable_dir_service);
+DECLARE_bool(enable_protobuf_arena_for_rpc);
 
 namespace policy {
 DECLARE_bool(use_http_error_code);
@@ -347,6 +349,18 @@ public:
         ncalled.fetch_add(1);
     }
     butil::atomic<int> ncalled;
+};
+
+class EchoServiceV3 : public v3::EchoService {
+public:
+    void Echo(google::protobuf::RpcController*,
+              const v3::EchoRequest* request,
+              v3::EchoResponse* response,
+              google::protobuf::Closure* done) override {
+        brpc::ClosureGuard done_guard(done);
+        ASSERT_EQ(EXP_REQUEST, request->message());
+        response->set_message(EXP_RESPONSE);
+    }
 };
 
 TEST_F(ServerTest, empty_enabled_protocols) {
@@ -1762,6 +1776,78 @@ TEST_F(ServerTest, generic_call) {
         ASSERT_EQ(EXP_RESPONSE, res.message());
         ASSERT_EQ(EXP_RESPONSE, cntl.response_attachment().to_string());
     }
+
+    ASSERT_EQ(0, server.Stop(0));
+    ASSERT_EQ(0, server.Join());
+}
+
+class TestRpcPBMessageFactory : public brpc::RpcPBMessageFactory {
+public:
+    brpc::RpcPBMessages* Get(const google::protobuf::Service& service,
+                             const google::protobuf::MethodDescriptor& method) override {
+        auto messages = butil::get_object<brpc::DefaultRpcPBMessages>();
+        auto request = butil::get_object<v3::EchoRequest>();
+        auto response = butil::get_object<v3::EchoResponse>();
+        request->clear_message();
+        response->clear_message();
+        messages->request = request;
+        messages->response = response;
+        return messages;
+    }
+
+    void Return(brpc::RpcPBMessages* messages) override {
+        auto test_messages = static_cast<brpc::DefaultRpcPBMessages*>(messages);
+        butil::return_object(static_cast<v3::EchoRequest*>(test_messages->request));
+        butil::return_object(static_cast<v3::EchoResponse*>(test_messages->response));
+        butil::return_object(test_messages);
+    }
+};
+
+void TestRpcPBMessageFactoryFunc(butil::EndPoint ep) {
+    brpc::Channel chan;
+    brpc::ChannelOptions copt;
+    copt.protocol = "baidu_std";
+    ASSERT_EQ(0, chan.Init(ep, &copt));
+    brpc::Controller cntl;
+    v3::EchoRequest req;
+    v3::EchoResponse res;
+    req.set_message(EXP_REQUEST);
+    v3::EchoService_Stub stub(&chan);
+    stub.Echo(&cntl, &req, &res, NULL);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+};
+
+TEST_F(ServerTest, rpc_pb_message_factory) {
+    butil::EndPoint ep;
+    ASSERT_EQ(0, str2endpoint("127.0.0.1:8613", &ep));
+    brpc::Server server;
+    EchoServiceV3 service;
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions opt;
+    opt.rpc_pb_message_factory = new TestRpcPBMessageFactory;
+    ASSERT_EQ(0, server.Start(ep, &opt));
+
+    TestRpcPBMessageFactoryFunc(ep);
+
+    ASSERT_EQ(0, server.Stop(0));
+    ASSERT_EQ(0, server.Join());
+}
+
+TEST_F(ServerTest, protobuf_arena) {
+    butil::EndPoint ep;
+    ASSERT_EQ(0, str2endpoint("127.0.0.1:8613", &ep));
+    brpc::Server server;
+    EchoServiceV3 service;
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    ASSERT_EQ(0, server.Start(ep, NULL));
+
+    bool enable_protobuf_arena_for_rpc_saved = brpc::FLAGS_enable_protobuf_arena_for_rpc;
+    brpc::FLAGS_enable_protobuf_arena_for_rpc = false;
+    TestRpcPBMessageFactoryFunc(ep);
+    brpc::FLAGS_enable_protobuf_arena_for_rpc = true;
+    TestRpcPBMessageFactoryFunc(ep);
+    brpc::FLAGS_enable_protobuf_arena_for_rpc = enable_protobuf_arena_for_rpc_saved;
 
     ASSERT_EQ(0, server.Stop(0));
     ASSERT_EQ(0, server.Join());
