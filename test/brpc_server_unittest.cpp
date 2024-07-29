@@ -1767,4 +1767,55 @@ TEST_F(ServerTest, generic_call) {
     ASSERT_EQ(0, server.Join());
 }
 
+class TestRpcPBMessageFactory : public brpc::RpcPBMessageFactory {
+public:
+    brpc::RpcPBMessages* Get(const google::protobuf::Service& service,
+                             const google::protobuf::MethodDescriptor& method) override {
+        auto messages = butil::get_object<brpc::DefaultRpcPBMessages>();
+        auto request = butil::get_object<test::EchoRequest>();
+        auto response = butil::get_object<test::EchoResponse>();
+        request->clear_message();
+        response->clear_message();
+        messages->request = request;
+        messages->response = response;
+        return messages;
+    }
+
+    void Return(brpc::RpcPBMessages* messages) override {
+        auto test_messages = static_cast<brpc::DefaultRpcPBMessages*>(messages);
+        butil::return_object(static_cast<test::EchoRequest*>(test_messages->request));
+        butil::return_object(static_cast<test::EchoResponse*>(test_messages->response));
+        test_messages->request = NULL;
+        test_messages->response = NULL;
+        butil::return_object(test_messages);
+    }
+};
+
+TEST_F(ServerTest, rpc_pb_message_factory) {
+    butil::EndPoint ep;
+    ASSERT_EQ(0, str2endpoint("127.0.0.1:8613", &ep));
+    brpc::Server server;
+    EchoServiceImpl service;
+    ASSERT_EQ(0, server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE));
+    brpc::ServerOptions opt;
+    opt.rpc_pb_message_factory = new TestRpcPBMessageFactory;
+    ASSERT_EQ(0, server.Start(ep, &opt));
+
+    brpc::Channel chan;
+    brpc::ChannelOptions copt;
+    copt.protocol = "baidu_std";
+    ASSERT_EQ(0, chan.Init(ep, &copt));
+    brpc::Controller cntl;
+    test::EchoRequest req;
+    test::EchoResponse res;
+    req.set_message(EXP_REQUEST);
+    test::EchoService_Stub stub(&chan);
+    stub.Echo(&cntl, &req, &res, NULL);
+    ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
+    ASSERT_EQ(EXP_RESPONSE, res.message());
+
+    ASSERT_EQ(0, server.Stop(0));
+    ASSERT_EQ(0, server.Join());
+}
+
 } //namespace
