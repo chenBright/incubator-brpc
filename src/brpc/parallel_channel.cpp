@@ -24,13 +24,7 @@
 #include "brpc/details/controller_private_accessor.h"
 #include "brpc/parallel_channel.h"
 
-
 namespace brpc {
-
-ParallelChannelOptions::ParallelChannelOptions()
-    : timeout_ms(500)
-    , fail_limit(-1) {
-}
 
 DECLARE_bool(usercode_in_pthread);
 
@@ -45,12 +39,15 @@ static __thread Memory tls_cached_pchan_mem = { 0, NULL };
 
 class ParallelChannelDone : public google::protobuf::Closure {
 private:
-    ParallelChannelDone(int fail_limit, int ndone, int nchan, int memsize,
+    ParallelChannelDone(int fail_limit, int success_limit,
+                        int ndone, int nchan, int memsize,
                         Controller* cntl, google::protobuf::Closure* user_done)
-        : _fail_limit(fail_limit)
+        :_fail_limit(fail_limit)
+        , _success_limit(success_limit)
         , _ndone(ndone)
         , _nchan(nchan)
         , _memsize(memsize)
+        , _current_success(0)
         , _current_fail(0)
         , _current_done(0)
         , _cntl(cntl)
@@ -89,7 +86,8 @@ public:
     };
     
     static ParallelChannelDone* Create(
-        int fail_limit, int ndone, const SubCall* aps, int nchan,
+        int fail_limit, int success_limit,
+        int ndone, const SubCall* aps, int nchan,
         Controller* cntl, google::protobuf::Closure* user_done) {
         // We need to create the object in this way because _sub_done is
         // dynamically allocated.
@@ -131,7 +129,7 @@ public:
         }
 #endif
         ParallelChannelDone* d = new (mem) ParallelChannelDone(
-            fail_limit, ndone, nchan, memsize, cntl, user_done);
+            fail_limit, success_limit, ndone, nchan, memsize, cntl, user_done);
 
         // Apply client settings of _cntl to controllers of sub calls, except
         // timeout. If we let sub channel do their timeout separately, when
@@ -220,14 +218,25 @@ public:
         if (fin != NULL) {
             // [ called from SubDone::Run() ]
 
-            // Count failed sub calls, if fail_limit is reached, cancel others.
-            if (fin->cntl.FailedInline() &&
-                _current_fail.fetch_add(1, butil::memory_order_relaxed) + 1
-                == _fail_limit) {
+            int error_code = fin->cntl.ErrorCode();
+            // EPCHANFINISH is not an error of sub calls.
+            bool fail = 0 != error_code && EPCHANFINISH != error_code;
+            bool cancel =
+                // Count failed sub calls, if `fail_limit' is reached, cancel others.
+                (fail && _current_fail.fetch_add(1, butil::memory_order_relaxed) + 1
+                         == _fail_limit) ||
+                // Count successful sub calls, if `success_limit' is reached, cancel others.
+                (0 == error_code &&
+                 _current_success.fetch_add(1, butil::memory_order_relaxed) + 1
+                 == _success_limit);
+
+            if (cancel) {
+                // Only cancel once by `fail_limit' or `success_limit'.
                 for (int i = 0; i < _ndone; ++i) {
                     SubDone* sd = sub_done(i);
                     if (fin != sd) {
-                        bthread_id_error(sd->cntl.call_id(), ECANCELED);
+                        bthread_id_error(
+                            sd->cntl.call_id(), fail ? ECANCELED : EPCHANFINISH);
                     }
                 }
             }
@@ -423,6 +432,7 @@ public:
 
 private:
     int _fail_limit;
+    int _success_limit;
     int _ndone;
     int _nchan;
 #if defined(__clang__)
@@ -430,6 +440,7 @@ private:
 #else
     int _memsize;
 #endif
+    butil::atomic<int> _current_success;
     butil::atomic<int> _current_fail;
     butil::atomic<uint32_t> _current_done;
     Controller* _cntl;
@@ -602,6 +613,7 @@ void ParallelChannel::CallMethod(
     ParallelChannelDone* d = NULL;
     int ndone = nchan;
     int fail_limit = 1;
+    int success_limit = 1;
     DEFINE_SMALL_ARRAY(SubCall, aps, nchan, 64);
 
     if (cntl->FailedInline()) {
@@ -655,9 +667,21 @@ void ParallelChannel::CallMethod(
             fail_limit = ndone;
         }
     }
-    
-    d = ParallelChannelDone::Create(fail_limit, ndone, aps, nchan,
-                                    cntl, done);
+
+    // `success_limit' is only valid when `fail_limit' is not set.
+    if (_options.fail_limit >= 0 || _options.success_limit < 0) {
+        success_limit = ndone;
+    } else {
+        success_limit = _options.success_limit;
+        if (success_limit < 1) {
+            success_limit = 1;
+        } else if (success_limit > ndone) {
+            success_limit = ndone;
+        }
+    }
+
+    d = ParallelChannelDone::Create(
+        fail_limit, success_limit, ndone, aps, nchan, cntl, done);
     if (NULL == d) {
         cntl->SetFailed(ENOMEM, "Fail to new ParallelChannelDone");
         goto FAIL;
