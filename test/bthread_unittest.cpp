@@ -617,11 +617,144 @@ TEST_F(BthreadTest, yield_single_thread) {
     ASSERT_EQ(0, bthread_join(tid, NULL));
 }
 
-#ifdef BRPC_BTHREAD_TRACER
+typedef void* (test_fn_t)(void*);
+
+void* test(void* arg) {
+    std::unique_ptr<int> p(new int);
+    auto fn = (test_fn_t*)arg;
+    return (*fn)((void*)1);
+}
+
+void* test1(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test(arg);
+}
+
+void* test2(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test1(arg);
+}
+
+void* test3(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test2(arg);
+}
+
+void* test4(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test3(arg);
+}
+
+void* test5(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test4(arg);
+}
+
+void* test6(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test5(arg);
+}
+
+void* test7(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test6(arg);
+}
+
+void* test8(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test7(arg);
+}
+
+void* test9(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test8(arg);
+}
+
+void* test10(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test9(arg);
+}
+
+void* test11(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test10(arg);
+}
+
+void* test12(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test11(arg);
+}
+
+void* test13(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test12(arg);
+}
+
+void* test14(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test13(arg);
+}
+
+void* test15(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test14(arg);
+}
+
+void* test16(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test15(arg);
+}
+
+void* test17(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test16(arg);
+}
+
+void* test18(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test17(arg);
+}
+
+void* test19(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test18(arg);
+}
+
+void* test20(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test19(arg);
+}
+
+void* test21(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test20(arg);
+}
+
+void* test22(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test21(arg);
+}
+
+void* test23(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test22(arg);
+}
+
+void* test24(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test23(arg);
+}
+
+void* test25(void* arg) {
+    std::unique_ptr<int> p(new int);
+    return test24(arg);
+}
+
+// #ifdef BRPC_BTHREAD_TRACER
 TEST_F(BthreadTest, trace) {
     stop = false;
     bthread_t th;
-    ASSERT_EQ(0, bthread_start_urgent(&th, NULL, spin_and_log, (void*)1));
+    ASSERT_EQ(0, bthread_start_urgent(&th, NULL, test25, (void*)spin_and_log));
     usleep(100 * 1000);
     std::string st = bthread::stack_trace(th);
     LOG(INFO) << "spin_and_log stack trace:\n" << st;
@@ -630,7 +763,7 @@ TEST_F(BthreadTest, trace) {
     ASSERT_EQ(0, bthread_join(th, NULL));
 
     stop = false;
-    ASSERT_EQ(0, bthread_start_urgent(&th, NULL, repeated_sleep, (void*)1));
+    ASSERT_EQ(0, bthread_start_urgent(&th, NULL, test25, (void*)repeated_sleep));
     usleep(100 * 1000);
     st = bthread::stack_trace(th);
     LOG(INFO) << "repeated_sleep stack trace:\n" << st;
@@ -643,6 +776,6 @@ TEST_F(BthreadTest, trace) {
     ASSERT_NE(std::string::npos, st.find("not exist now"));
 
 }
-#endif // BRPC_BTHREAD_TRACER
+// #endif // BRPC_BTHREAD_TRACER
 
 } // namespace

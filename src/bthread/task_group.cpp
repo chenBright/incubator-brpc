@@ -1013,13 +1013,15 @@ void print_task(std::ostream& os, bthread_t tid) {
            << "}\nhas_tls=" << has_tls
            << "\nuptime_ns=" << butil::cpuwide_time_ns() - cpuwide_start_ns
            << "\ncputime_ns=" << stat.cputime_ns
-            << "\nnswitch=" << stat.nswitch
+           << "\nnswitch=" << stat.nswitch
 #ifdef BRPC_BTHREAD_TRACER
            << "\nstatus=" << status
            << "\ntraced=" << traced
            << "\nworker_tid=" << worker_tid;
-#endif // BRPC_BTHREAD_TRACER
+#else
            ;
+           (void)status;(void)traced;(void)worker_tid;
+#endif // BRPC_BTHREAD_TRACER
     }
 }
 

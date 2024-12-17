@@ -18,9 +18,9 @@
 #ifndef BRPC_BTHREAD_TRACER_H
 #define BRPC_BTHREAD_TRACER_H
 
-#ifdef BRPC_BTHREAD_TRACER
+// #ifdef BRPC_BTHREAD_TRACER
 
-#include <signal.h>
+#include <semaphore.h>
 #include <vector>
 #include <libunwind.h>
 #include "butil/strings/safe_sprintf.h"
@@ -60,12 +60,6 @@ private:
         int _errno;
     };
 
-    enum SignalTraceStatus {
-        SIGNAL_TRACE_STATUS_UNKNOWN = 0,
-        SIGNAL_TRACE_STATUS_START,
-        SIGNAL_TRACE_STATUS_TRACING,
-    };
-
     struct Result {
         template<typename... Args>
         static Result MakeErrorResult(const char* fmt, Args... args) {
@@ -75,14 +69,18 @@ private:
             return result;
         }
 
+        template<typename... Args>
+        Result SetError(const char* fmt, Args... args) {
+            error = true;
+            butil::strings::SafeSPrintf(err_msg, fmt, args...);
+        }
+
         static const size_t MAX_TRACE_NUM = 64;
         unw_word_t ips[MAX_TRACE_NUM];
+        char mangled[MAX_TRACE_NUM][256]{};
         size_t frame_count{0};
         bool error{false};
-        union {
-            char mangled[MAX_TRACE_NUM][256]{};
-            char err_msg[256];
-        };
+        char err_msg[128]{};
 
         bool fast_unwind{false};
     };
@@ -97,6 +95,9 @@ private:
     static int RegisterSignalHandler();
     static void SignalHandler(int sig, siginfo_t* info, void* context);
     void SignalTraceHandler(unw_context_t* context);
+    bool ClearForSignalTrace(Result& result);
+    bool WaitForSignalHandler(const timespec* abs_timeout, Result& result);
+    bool NotifySignalHandler(Result& result);
     Result SignalTrace(pid_t worker_tid);
 
     unw_cursor_t MakeCursor(bthread_fcontext_t fcontext);
@@ -114,7 +115,9 @@ private:
     unw_context_t _context{};
     // For signal trace.
     unw_context_t* _signal_handler_context{NULL};
-    butil::atomic<SignalTraceStatus> _signal_handler_flag{SIGNAL_TRACE_STATUS_UNKNOWN};
+    sem_t _sem{};
+    int _pipe_fds[2]{};
+    // butil::atomic<SignalTraceStatus> _signal_handler_flag{SIGNAL_TRACE_STATUS_UNKNOWN};
 
     // Protect `_worker_tids'.
     butil::Mutex _worker_mutex;
@@ -129,4 +132,4 @@ private:
 
 #endif // BRPC_BTHREAD_TRACER
 
-#endif // BRPC_BTHREAD_TRACER_H
+// #endif // BRPC_BTHREAD_TRACER_H

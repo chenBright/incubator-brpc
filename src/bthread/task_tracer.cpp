@@ -15,23 +15,46 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifdef BRPC_BTHREAD_TRACER
+// #ifdef BRPC_BTHREAD_TRACER
 
 #include "bthread/task_tracer.h"
+#include <unistd.h>
+#include <signal.h>
+#include <poll.h>
+#include <gflags/gflags.h>
+#include "butil/fd_utility.h"
 #include "butil/debug/stack_trace.h"
 #include "butil/memory/scope_guard.h"
 #include "bthread/task_group.h"
 #include "bthread/processor.h"
+// todo move到butil？
+#include "brpc/reloadable_flags.h"
 
 namespace bthread {
 
 DEFINE_bool(enable_fast_unwind, true, "Whether to enable fast unwind");
 DEFINE_uint32(signal_trace_timeout_ms, 50, "Timeout for signal trace in ms");
+BRPC_VALIDATE_GFLAG(signal_trace_timeout_ms, [](const char*, uint32_t v) {
+    return v > 0;
+});
 
 extern BAIDU_THREAD_LOCAL TaskMeta* pthread_fake_meta;
 
 int TaskTracer::Init() {
-    if (RegisterSignalHandler() != 0) {
+    if (pipe(_pipe_fds) != 0) {
+        PLOG(ERROR) << "Fail to pipe";
+        return -1;
+    }
+    if (butil::make_non_blocking(_pipe_fds[0]) != 0) {
+        PLOG(ERROR) << "Fail to make_non_blocking";
+        return -1;
+    }
+    if (butil::make_non_blocking(_pipe_fds[1]) != 0) {
+        PLOG(ERROR) << "Fail to make_non_blocking";
+        return -1;
+    }
+    if (sem_init(&_sem, 0, 0) != 0) {
+        PLOG(ERROR) << "Fail to sem_init";
         return -1;
     }
     if (_trace_time.expose("bthread_trace_time") != 0) {
@@ -41,6 +64,9 @@ int TaskTracer::Init() {
         return -1;
     }
     if (_signal_handler_time.expose("bthread_signal_handler_time") != 0) {
+        return -1;
+    }
+    if (RegisterSignalHandler() != 0) {
         return -1;
     }
     return 0;
@@ -155,6 +181,7 @@ TaskTracer::Result TaskTracer::TraceImpl(bthread_t tid) {
     BRPC_SCOPE_EXIT {
         timer.stop();
         _trace_time << timer.n_elapsed();
+        LOG(INFO) << "Trace time: " << timer.u_elapsed();
     };
 
     if (tid == bthread_self() ||
@@ -277,7 +304,7 @@ int TaskTracer::RegisterSignalHandler() {
         return -1;
     }
     if (NULL != old_sa.sa_handler || NULL != old_sa.sa_sigaction) {
-        LOG(ERROR) << "SIGURG is already registered";
+        LOG(ERROR) << "Signal handler of SIGURG is already registered";
         return -1;
     }
 
@@ -296,12 +323,6 @@ void TaskTracer::SignalHandler(int, siginfo_t* info, void* context) {
 
 // Caution: This function is called in signal handler, so it should be async-signal-safety.
 void TaskTracer::SignalTraceHandler(unw_context_t* context) {
-    // Something wrong, signal trace is not started, do nothing.
-    if (SIGNAL_TRACE_STATUS_START !=
-        _signal_handler_flag.load(butil::memory_order_acquire)) {
-        return;
-    }
-
     butil::Timer timer(butil::Timer::STARTED);
     BRPC_SCOPE_EXIT {
         timer.stop();
@@ -309,23 +330,114 @@ void TaskTracer::SignalTraceHandler(unw_context_t* context) {
     };
 
     _signal_handler_context = context;
-    // Use memory_order_seq_cst to ensure the flag is set before loop.
-    _signal_handler_flag.store(SIGNAL_TRACE_STATUS_TRACING, butil::memory_order_seq_cst);
-    while (SIGNAL_TRACE_STATUS_TRACING ==
-           _signal_handler_flag.load(butil::memory_order_seq_cst)) {
-        SignalSafeUsleep(50); // 50us
-        // Timeout to avoid deadlock of libunwind.
+    // Notify SignalTrace that SignalTraceHandler has started.
+    // Binary semaphore do not fail, so no need to check return value.
+    sem_post(&_sem);
+    pollfd poll_fd = {_pipe_fds[0], POLLIN, 0};
+    while (true) {
         timer.stop();
-        if (timer.m_elapsed() > FLAGS_signal_trace_timeout_ms) {
+        int timeout = FLAGS_signal_trace_timeout_ms - timer.m_elapsed();
+        int rc = poll(&poll_fd, 1, timeout);
+        if (rc > 0) {
             break;
+        } else if (rc == 0) {
+            errno = ETIMEDOUT;
+            return;
+        } else {
+            if (errno == EINTR) {
+                continue;
+            }
+            return;
         }
     }
+
+    // Notify SignalTrace that SignalTraceHandler has started.
+    // Binary semaphore do not fail, so no need to check return value.
+    sem_post(&_sem);
+}
+
+bool TaskTracer::ClearForSignalTrace(Result& result) {
+    // Clear the pipe.
+    while (true) {
+        char c;
+        ssize_t nr = read(_pipe_fds[1], &c, 1);
+        if (nr > 0) {
+            continue;
+        } else if (0 == nr) {
+            break;
+        } else {
+            if (EINTR == errno) {
+                continue;
+            } else if (EAGAIN == errno) {
+                break;
+            }
+            result.SetError("Fail to read pipe: %s", berror());
+            return false;
+        }
+    }
+
+    // Clear the semaphore.
+    while (true) {
+        int rc = sem_trywait(&_sem);
+        if (0 == rc) {
+            continue;
+        } else {
+            if (EINTR == errno) {
+                continue;
+            } else if (EAGAIN == errno) {
+                // The semaphore is already cleared.
+                break;
+            }
+            result.SetError("Fail to sem_trywait: %s", berror());
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool TaskTracer::WaitForSignalHandler(const timespec* abs_timeout, Result& result) {
+    while (sem_timedwait(&_sem, abs_timeout) == -1) {
+        if (EINTR == errno) {
+            continue;
+        }
+        if (ETIMEDOUT == errno) {
+            result.SetError("Timeout exceed %dms", FLAGS_signal_trace_timeout_ms);
+        } else {
+            // During the process of signal handler,
+            // can not use berro() which is not async-signal-safe.
+            result.SetError("Fail to sem_timedwait, errno=%d", errno);
+        }
+        return false;
+    }
+    return true;
+}
+
+bool TaskTracer::NotifySignalHandler(Result& result) {
+    while (true) {
+        ssize_t nw = write(_pipe_fds[1], "1", 1);
+        if (0 < nw) {
+            break;
+        } else if (0 == nw) {
+            continue;
+        } else {
+            if (EINTR == errno) {
+                continue;
+            } else if (EAGAIN == errno) {
+                break;
+            }
+            result.SetError("Fail to write pipe: %s", berror());
+            return false;
+        }
+    }
+    return true;
 }
 
 TaskTracer::Result TaskTracer::SignalTrace(pid_t tid) {
-    _signal_handler_context = NULL;
-    // Use memory_order_seq_cst to ensure the flag is set before sending signal.
-    _signal_handler_flag.store(SIGNAL_TRACE_STATUS_START, butil::memory_order_seq_cst);
+    Result result;
+    if (!ClearForSignalTrace(result)) {
+        return result;
+    }
 
     // CAUTION:
     // The signal handler will wait for the backtrace to complete.
@@ -345,8 +457,7 @@ TaskTracer::Result TaskTracer::SignalTrace(pid_t tid) {
     // #0  __lll_lock_wait (futex=futex@entry=0x7f0d3d7f0990 <_rtld_global+2352>, private=0) at lowlevellock.c:52
     // #1  0x00007f0d3a73c131 in __GI___pthread_mutex_lock (mutex=0x7f0d3d7f0990 <_rtld_global+2352>) at ../nptl/pthread_mutex_lock.c:115
     // #2  0x00007f0d38eb0231 in __GI___dl_iterate_phdr (callback=callback@entry=0x7f0d38c456a0 <_ULx86_64_dwarf_callback>, data=data@entry=0x7f0d07defad0) at dl-iteratephdr.c:40
-    // #3  0x00007f0d38c45d79 in _ULx86_64_dwarf_find_proc_info (as=0x7f0d38c4f340 <local_addr_space>, ip=ip@entry=139694791966897, pi=pi@entry=0x7f0d07df0498, need_unwind_info=need_unwind_info@entry=1, arg=0x7f0
-    // d07df0340) at dwarf/Gfind_proc_info-lsb.c:759
+    // #3  0x00007f0d38c45d79 in _ULx86_64_dwarf_find_proc_info (as=0x7f0d38c4f340 <local_addr_space>, ip=ip@entry=139694791966897, pi=pi@entry=0x7f0d07df0498, need_unwind_info=need_unwind_info@entry=1, arg=0x7f0d07df0340) at dwarf/Gfind_proc_info-lsb.c:759
     // #4  0x00007f0d38c43260 in fetch_proc_info (c=c@entry=0x7f0d07df0340, ip=139694791966897) at dwarf/Gparser.c:461
     // #5  0x00007f0d38c44e46 in find_reg_state (sr=0x7f0d07defd10, c=0x7f0d07df0340) at dwarf/Gparser.c:925
     // #6  _ULx86_64_dwarf_step (c=c@entry=0x7f0d07df0340) at dwarf/Gparser.c:972
@@ -374,6 +485,10 @@ TaskTracer::Result TaskTracer::SignalTrace(pid_t tid) {
     // backtracks with dl_iterate_phdr. We introduce a timeout mechanism in signal
     // handler to avoid deadlock.
 
+    butil::Timer timer(butil::Timer::STARTED);
+
+    _signal_handler_context = NULL;
+
     union sigval value{};
     value.sival_ptr = this;
     size_t sigqueue_try = 0;
@@ -383,36 +498,30 @@ TaskTracer::Result TaskTracer::SignalTrace(pid_t tid) {
         }
     }
 
-    butil::Timer timer(butil::Timer::STARTED);
-    // Use memory_order_seq_cst to ensure the signal is sent and the flag is set before checking.
-    for (int i = 0;
-         SIGNAL_TRACE_STATUS_START == _signal_handler_flag.load(butil::memory_order_seq_cst);
-         ++i) {
-        if (i < 30) {
-            sched_yield();
-        } else {
-            SignalSafeUsleep(5); // 5us
-        }
-
-        // Timeout to avoid dead loop if handler of SIGURG is covered.
-        timer.stop();
-        if (timer.m_elapsed() > FLAGS_signal_trace_timeout_ms) {
-            return Result::MakeErrorResult(
-                "Timeout exceed %dms", FLAGS_signal_trace_timeout_ms);
-        }
+    timespec abs_timeout = butil::milliseconds_from_now(FLAGS_signal_trace_timeout_ms);
+    // Wait for the signal handler to start.
+    if (!WaitForSignalHandler(&abs_timeout, result)) {
+        return result;
     }
 
     unw_cursor_t cursor;
-    int  rc = unw_init_local(&cursor, _signal_handler_context);
-    Result result;
-    if (0 == rc) {
-        result = TraceCore(cursor);
+    int rc = unw_init_local(&cursor, _signal_handler_context);
+    if (0 != rc) {
+        return Result::MakeErrorResult("Failed to init local, rc=%d", rc);
+    }
+    result = TraceCore(cursor);
+
+    NotifySignalHandler(result);
+
+    // Wait for the signal handler to end.
+    if (!WaitForSignalHandler(NULL, result)) {
+        return result;
     }
 
-    // Use memory_order_seq_cst to ensure the flag is set after tracing.
-    _signal_handler_flag.store(SIGNAL_TRACE_STATUS_UNKNOWN, butil::memory_order_seq_cst);
+    timer.stop();
+    LOG(INFO) << "Signal trace time: " << timer.u_elapsed();
 
-    return 0 == rc ? result : Result::MakeErrorResult("Failed to init local, rc=%d", rc);
+    return result;
 }
 
 unw_cursor_t TaskTracer::MakeCursor(bthread_fcontext_t fcontext) {
@@ -484,4 +593,4 @@ TaskTracer::Result TaskTracer::TraceCore(unw_cursor_t& cursor) {
 
 } // namespace bthread
 
-#endif // BRPC_BTHREAD_TRACER
+// #endif // BRPC_BTHREAD_TRACER

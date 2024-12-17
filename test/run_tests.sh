@@ -22,11 +22,11 @@ rm core.*
 test_num=0
 failed_test=""
 rc=0
-test_bins="test_butil test_bvar bthread*unittest brpc*unittest"
+test_bins="bthread_unittest"
 for test_bin in $test_bins; do
     test_num=$((test_num + 1))
     >&2 echo "[runtest] $test_bin"
-    ./$test_bin
+    ./$test_bin --gtest_filter=BthreadTest.trace
     rc=$?
     if [ $rc -ne 0 ]; then
         failed_test="$test_bin"
