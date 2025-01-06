@@ -492,6 +492,7 @@ Socket::Socket(Forbidden f)
     , _stream_set(NULL)
     , _total_streams_unconsumed_size(0)
     , _ninflight_app_health_check(0)
+    , _tcp_user_timeout_ms(-1)
     , _http_request_method(HTTP_METHOD_GET) {
     CreateVarsOnce();
     pthread_mutex_init(&_id_wait_list_mutex, NULL);
@@ -597,6 +598,21 @@ int Socket::ResetFileDescriptor(int fd) {
     // turn off nagling.
     // OK to fail, namely unix domain socket does not support this.
     butil::make_no_delay(fd);
+
+    EnableSocketOptionsIfNeeded(fd);
+
+    if (_on_edge_triggered_events) {
+        if (_io_event.AddConsumer(fd) != 0) {
+            PLOG(ERROR) << "Fail to add SocketId=" << id() 
+                        << " into EventDispatcher";
+            _fd.store(-1, butil::memory_order_release);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+void Socket::EnableSocketOptionsIfNeeded(int fd) {
     if (_tos > 0 &&
         setsockopt(fd, IPPROTO_IP, IP_TOS, &_tos, sizeof(_tos)) != 0) {
         PLOG(ERROR) << "Fail to set tos of fd=" << fd << " to " << _tos;
@@ -618,27 +634,21 @@ int Socket::ResetFileDescriptor(int fd) {
         }
     }
 
-    EnableKeepaliveIfNeeded(fd);
-
-    if (_on_edge_triggered_events) {
-        if (_io_event.AddConsumer(fd) != 0) {
-            PLOG(ERROR) << "Fail to add SocketId=" << id() 
-                        << " into EventDispatcher";
-            _fd.store(-1, butil::memory_order_release);
-            return -1;
+#if defined(OS_LINUX)
+    if (_tcp_user_timeout_ms > 0) {
+        if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                       &_tcp_user_timeout_ms, sizeof(_tcp_user_timeout_ms)) != 0) {
+            PLOG(ERROR) << "Fail to set TCP_USER_TIMEOUT of fd=" << fd;
         }
     }
-    return 0;
-}
+#endif
 
-void Socket::EnableKeepaliveIfNeeded(int fd) {
     if (!_keepalive_options) {
         return;
     }
 
     int keepalive = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive,
-                   sizeof(keepalive)) != 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive)) != 0) {
         PLOG(ERROR) << "Fail to set keepalive of fd=" << fd;
         return;
     }
@@ -665,6 +675,12 @@ void Socket::EnableKeepaliveIfNeeded(int fd) {
                        &_keepalive_options->keepalive_count,
                        sizeof(_keepalive_options->keepalive_count)) != 0) {
             PLOG(ERROR) << "Fail to set keepcnt of fd=" << fd;
+        }
+    }
+    if (_tcp_user_timeout_ms > 0) {
+        if (setsockopt(fd, SOL_TCP, TCP_USER_TIMEOUT,
+                       &_tcp_user_timeout_ms, sizeof(_tcp_user_timeout_ms)) != 0) {
+            PLOG(ERROR) << "Fail to set TCP_USER_TIMEOUT of fd=" << fd;
         }
     }
 #elif defined(OS_MACOSX)
@@ -782,6 +798,7 @@ int Socket::OnCreated(const SocketOptions& options) {
     _last_writetime_us.store(cpuwide_now, butil::memory_order_relaxed);
     _unwritten_bytes.store(0, butil::memory_order_relaxed);
     _keepalive_options = options.keepalive_options;
+    _tcp_user_timeout_ms = options.tcp_user_timeout_ms;
     CHECK(NULL == _write_head.load(butil::memory_order_relaxed));
     _is_write_shutdown = false;
     int fd = options.fd;
@@ -2500,6 +2517,16 @@ void Socket::DebugSocket(std::ostream& os, SocketId id) {
         }
 #endif
     }
+
+#if defined(OS_LINUX)
+    {
+        int tcp_user_timeout = 0;
+        socklen_t len = sizeof(tcp_user_timeout);
+        if (getsockopt(fd, SOL_TCP, TCP_USER_TIMEOUT, &tcp_user_timeout, &len) == 0) {
+            os << "\ntcp_user_timeout=" << tcp_user_timeout;
+        }
+    }
+#endif
 
 #if defined(OS_MACOSX)
     struct tcp_connection_info ti;
