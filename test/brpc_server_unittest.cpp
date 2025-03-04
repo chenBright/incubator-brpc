@@ -57,6 +57,7 @@
 #include "v1.pb.h"
 #include "v2.pb.h"
 #include "v3.pb.h"
+#include "butil/debug/stack_trace.h"
 
 int main(int argc, char* argv[]) {
     testing::InitGoogleTest(&argc, argv);
@@ -200,6 +201,33 @@ protected:
         EXPECT_EQ(-1, server.AddBuiltinServices());
     }
 };
+
+NOINLINE void TestFindSymbol1();
+NOINLINE void TestFindSymbol2();
+NOINLINE void TestFindSymbol3();
+
+NOINLINE void TestFindSymbol1() {
+    butil::debug::StackTrace trace;
+    ASSERT_TRUE(trace.ToString().find("TestFindSymbol1") != std::string::npos) << trace.ToString();
+    ASSERT_TRUE(trace.ToString().find("TestFindSymbol2") != std::string::npos) << trace.ToString();
+    ASSERT_TRUE(trace.ToString().find("TestFindSymbol3") == std::string::npos) << trace.ToString();
+    ASSERT_TRUE(trace.FindSymbol((void*)TestFindSymbol2)) << (void*)TestFindSymbol2 << std::endl << trace.ToString();
+    ASSERT_TRUE(trace.FindSymbol((void*)TestFindSymbol1)) << (void*)TestFindSymbol1 << std::endl << trace.ToString();
+    ASSERT_FALSE(trace.FindSymbol((void*)TestFindSymbol3)) << (void*)TestFindSymbol3 << std::endl << trace.ToString();
+}
+
+
+NOINLINE void TestFindSymbol3() {
+    TestFindSymbol1();
+}
+
+void TestFindSymbol2() {
+    TestFindSymbol1();
+}
+
+TEST_F(ServerTest, st) {
+    TestFindSymbol2();
+}
 
 TEST_F(ServerTest, sanity) {
     {

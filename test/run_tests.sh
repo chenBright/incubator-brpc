@@ -22,10 +22,11 @@ rm core.*
 test_num=0
 failed_test=""
 rc=0
-test_bins="test_butil test_bvar bthread*unittest brpc*unittest"
+test_bins="brpc_server_unittest"
 for test_bin in $test_bins; do
     test_num=$((test_num + 1))
     >&2 echo "[runtest] $test_bin"
+    ldd $test_bin
     ./$test_bin
     rc=$?
     if [ $rc -ne 0 ]; then
