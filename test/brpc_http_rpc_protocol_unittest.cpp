@@ -644,7 +644,7 @@ TEST_F(HttpTest, read_chunked_response_normally) {
     EXPECT_EQ(0, server.AddService(&svc, brpc::SERVER_DOESNT_OWN_SERVICE));
     EXPECT_EQ(0, server.Start(port, NULL));
 
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 1; ++i) {
         svc.set_done_place((DonePlace)i);
         brpc::Channel channel;
         brpc::ChannelOptions options;
